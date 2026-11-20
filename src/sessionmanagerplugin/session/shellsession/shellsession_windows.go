@@ -21,8 +21,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/aws/session-manager-plugin/src/log"
-	"github.com/aws/session-manager-plugin/src/message"
+	"github.com/esoel/session-manager-plugin/src/log"
+	"github.com/esoel/session-manager-plugin/src/message"
 	"github.com/eiannone/keyboard"
 )
 
