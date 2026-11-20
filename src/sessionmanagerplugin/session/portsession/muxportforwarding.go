@@ -54,7 +54,9 @@ type MgsConn struct {
 
 // Listen allows embedding applications to supply a persistent local listener.
 // Set once before starting sessions. Close must release an individual lease.
-var Listen = net.Listen
+var Listen = func(sessionID, network, address string) (net.Listener, error) {
+	return net.Listen(network, address)
+}
 
 // MuxPortForwarding is type of port session
 // accepts multiple client connections through multiplexing
@@ -120,11 +122,13 @@ func (p *MuxPortForwarding) InitializeStreams(log log.T, agentVersion string) (e
 
 // ReadStream reads data from different connections
 func (p *MuxPortForwarding) ReadStream(log log.T) (err error) {
-	base, cancel := context.WithCancel(context.Background())
+	base, cancel := context.WithCancel(p.session.Context())
 	defer cancel()
 	g, ctx := errgroup.WithContext(base)
 	if session.StopHook != nil {
-		go func() { <-ctx.Done(); p.Stop() }()
+		stopped := make(chan struct{})
+		go func() { defer close(stopped); <-ctx.Done(); p.Stop() }()
+		defer func() { cancel(); <-stopped }()
 	}
 
 	// reads data from smux client and transfers to server over datachannel
@@ -254,7 +258,7 @@ func (p *MuxPortForwarding) handleClientConnections(log log.T, ctx context.Conte
 	)
 
 	if p.portParameters.LocalConnectionType == "unix" {
-		if listener, err = Listen(p.portParameters.LocalConnectionType, p.portParameters.LocalUnixSocket); err != nil {
+		if listener, err = Listen(p.sessionId, p.portParameters.LocalConnectionType, p.portParameters.LocalUnixSocket); err != nil {
 			return err
 		}
 		displayMsg = fmt.Sprintf("Unix socket %s opened for sessionId %s.", p.portParameters.LocalUnixSocket, p.sessionId)
@@ -263,7 +267,7 @@ func (p *MuxPortForwarding) handleClientConnections(log log.T, ctx context.Conte
 		if p.portParameters.LocalPortNumber == "" {
 			localPortNumber = "0"
 		}
-		if listener, err = Listen("tcp", "localhost:"+localPortNumber); err != nil {
+		if listener, err = Listen(p.sessionId, "tcp", "localhost:"+localPortNumber); err != nil {
 			return err
 		}
 		p.portParameters.LocalPortNumber = strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)

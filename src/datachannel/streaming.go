@@ -1,3 +1,4 @@
+// Modified by the ssmc project: separate transport reconnect from session cleanup.
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may not
@@ -17,6 +18,7 @@ package datachannel
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -75,6 +77,10 @@ type IDataChannel interface {
 
 // DataChannel used for communication between the mgs and the cli.
 type DataChannel struct {
+	done                  chan struct{}
+	closeOnce             *sync.Once
+	resendWorkers         *sync.WaitGroup
+	cancel                context.CancelFunc
 	wsChannel             communicator.IWebSocketChannel
 	Role                  string
 	ClientId              string
@@ -162,6 +168,9 @@ var newEncrypter = func(log log.T, kmsKeyId string, encryptionConext map[string]
 
 // Initialize populates the data channel object with the correct values.
 func (dataChannel *DataChannel) Initialize(log log.T, clientId string, sessionId string, targetId string, isAwsCliUpgradeNeeded bool) {
+	dataChannel.done = make(chan struct{})
+	dataChannel.closeOnce = &sync.Once{}
+	dataChannel.resendWorkers = &sync.WaitGroup{}
 	//open data channel as publish_subscribe
 	log.Debugf("Calling Initialize Datachannel for role: %s", config.RolePublishSubscribe)
 
@@ -190,6 +199,15 @@ func (dataChannel *DataChannel) Initialize(log log.T, clientId string, sessionId
 	dataChannel.isStreamMessageResendTimeout = make(chan bool, 1)
 	dataChannel.sessionType = ""
 	dataChannel.IsAwsCliUpgradeNeeded = isAwsCliUpgradeNeeded
+}
+
+// SetContext binds network setup and transport workers to the owning session.
+// Call after Initialize and before Open.
+func (dataChannel *DataChannel) SetContext(ctx context.Context) {
+	ctx, dataChannel.cancel = context.WithCancel(ctx)
+	if ws, ok := dataChannel.wsChannel.(interface{ SetContext(context.Context) }); ok {
+		ws.SetContext(ctx)
+	}
 }
 
 // SetWebsocket function populates websocket channel object
@@ -237,16 +255,28 @@ func (dataChannel *DataChannel) Open(log log.T) (err error) {
 	return
 }
 
-// Close closes datachannel - its web socket connection
+// Close ends the channel lifetime and joins its transport and resend workers.
+// Call from the session owner, not from a transport callback.
 func (dataChannel *DataChannel) Close(log log.T) error {
-	log.Infof("Closing datachannel with url %s", dataChannel.wsChannel.GetStreamUrl())
-	return dataChannel.wsChannel.Close(log)
+	dataChannel.closeOnce.Do(func() {
+		close(dataChannel.done)
+		if dataChannel.cancel != nil {
+			dataChannel.cancel()
+		}
+	})
+	err := dataChannel.wsChannel.Close(log)
+	if ws, ok := dataChannel.wsChannel.(interface{ Wait() }); ok {
+		ws.Wait()
+	}
+	dataChannel.resendWorkers.Wait()
+	return err
 }
 
 // Reconnect calls ResumeSession API to reconnect datachannel when connection is lost
 func (dataChannel *DataChannel) Reconnect(log log.T) (err error) {
 
-	if err = dataChannel.Close(log); err != nil {
+	// A transport reconnect keeps the session's resend scheduler alive.
+	if err = dataChannel.wsChannel.Close(log); err != nil {
 		log.Debugf("Closing datachannel failed with error: %v", err)
 	}
 
@@ -331,9 +361,17 @@ func (dataChannel *DataChannel) SendInputDataMessage(
 // ResendStreamDataMessageScheduler spawns a separate go thread which keeps checking OutgoingMessageBuffer at fixed interval
 // and resends first message if time elapsed since lastSentTime of the message is more than acknowledge wait time
 func (dataChannel *DataChannel) ResendStreamDataMessageScheduler(log log.T) (err error) {
+	dataChannel.resendWorkers.Add(1)
 	go func() {
+		defer dataChannel.resendWorkers.Done()
+		ticker := time.NewTicker(config.ResendSleepInterval)
+		defer ticker.Stop()
 		for {
-			time.Sleep(config.ResendSleepInterval)
+			select {
+			case <-dataChannel.done:
+				return
+			case <-ticker.C:
+			}
 			dataChannel.OutgoingMessageBuffer.Mutex.Lock()
 			streamMessageElement := dataChannel.OutgoingMessageBuffer.Messages.Front()
 			dataChannel.OutgoingMessageBuffer.Mutex.Unlock()
@@ -347,10 +385,14 @@ func (dataChannel *DataChannel) ResendStreamDataMessageScheduler(log log.T) (err
 				log.Debugf("Resend stream data message %d for the %d attempt.", streamMessage.SequenceNumber, *streamMessage.ResendAttempt)
 				if *streamMessage.ResendAttempt >= config.ResendMaxAttempt {
 					log.Warnf("Message %d was resent over %d times.", streamMessage.SequenceNumber, config.ResendMaxAttempt)
-					dataChannel.isStreamMessageResendTimeout <- true
+					select {
+					case dataChannel.isStreamMessageResendTimeout <- true:
+					case <-dataChannel.done:
+					}
+					return
 				}
 				*streamMessage.ResendAttempt++
-				if err = SendMessageCall(log, dataChannel, streamMessage.Content, websocket.BinaryMessage); err != nil {
+				if err := SendMessageCall(log, dataChannel, streamMessage.Content, websocket.BinaryMessage); err != nil {
 					log.Errorf("Unable to send stream data message: %s", err)
 				}
 				streamMessage.LastSentTime = time.Now()

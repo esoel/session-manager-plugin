@@ -1,3 +1,4 @@
+// Modified by the ssmc project: cancellable, joined transport workers.
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may not
@@ -15,6 +16,7 @@
 package communicator
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -42,11 +44,15 @@ type IWebSocketChannel interface {
 // WebSocketChannel parent class for DataChannel.
 type WebSocketChannel struct {
 	IWebSocketChannel
+	ctx          context.Context
+	stateMu      sync.Mutex
+	workers      sync.WaitGroup
+	done         chan struct{}
 	Url          string
 	OnMessage    func([]byte)
 	OnError      func(error)
 	IsOpen       bool
-	writeLock    *sync.Mutex
+	writeLock    sync.Mutex
 	Connection   *websocket.Conn
 	ChannelToken string
 }
@@ -68,13 +74,26 @@ func (webSocketChannel *WebSocketChannel) GetStreamUrl() string {
 
 // SetOnError sets OnError field of websocket channel
 func (webSocketChannel *WebSocketChannel) SetOnError(onErrorHandler func(error)) {
+	webSocketChannel.stateMu.Lock()
+	defer webSocketChannel.stateMu.Unlock()
 	webSocketChannel.OnError = onErrorHandler
 }
 
 // SetOnMessage sets OnMessage field of websocket channel
 func (webSocketChannel *WebSocketChannel) SetOnMessage(onMessageHandler func([]byte)) {
+	webSocketChannel.stateMu.Lock()
+	defer webSocketChannel.stateMu.Unlock()
 	webSocketChannel.OnMessage = onMessageHandler
 }
+
+// SetContext must be called before Open. Cancellation closes the active socket.
+func (webSocketChannel *WebSocketChannel) SetContext(ctx context.Context) {
+	webSocketChannel.ctx = ctx
+}
+
+// Wait joins all transport workers, including a pending reconnect callback.
+// Call after cancelling the session and closing its connection, outside callbacks.
+func (webSocketChannel *WebSocketChannel) Wait() { webSocketChannel.workers.Wait() }
 
 // Initialize initializes websocket channel fields
 func (webSocketChannel *WebSocketChannel) Initialize(log log.T, channelUrl string, channelToken string) {
@@ -84,22 +103,29 @@ func (webSocketChannel *WebSocketChannel) Initialize(log log.T, channelUrl strin
 
 // StartPings starts the pinging process to keep the websocket channel alive.
 func (webSocketChannel *WebSocketChannel) StartPings(log log.T, pingInterval time.Duration) {
-
+	webSocketChannel.stateMu.Lock()
+	conn, done := webSocketChannel.Connection, webSocketChannel.done
+	if !webSocketChannel.IsOpen {
+		webSocketChannel.stateMu.Unlock()
+		return
+	}
+	webSocketChannel.workers.Add(1)
+	webSocketChannel.stateMu.Unlock()
 	go func() {
+		defer webSocketChannel.workers.Done()
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
 		for {
-			if webSocketChannel.IsOpen == false {
-				return
-			}
-
-			log.Debug("WebsocketChannel: Send ping. Message.")
-			webSocketChannel.writeLock.Lock()
-			err := webSocketChannel.Connection.WriteMessage(websocket.PingMessage, []byte("keepalive"))
-			webSocketChannel.writeLock.Unlock()
+			err := conn.WriteControl(websocket.PingMessage, []byte("keepalive"), time.Now().Add(10*time.Second))
 			if err != nil {
 				log.Errorf("Error while sending websocket ping: %v", err)
 				return
 			}
-			time.Sleep(pingInterval)
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+			}
 		}
 	}()
 }
@@ -107,7 +133,10 @@ func (webSocketChannel *WebSocketChannel) StartPings(log log.T, pingInterval tim
 // SendMessage sends a byte message through the websocket connection.
 // Examples of message type are websocket.TextMessage or websocket.Binary
 func (webSocketChannel *WebSocketChannel) SendMessage(log log.T, input []byte, inputType int) error {
-	if webSocketChannel.IsOpen == false {
+	webSocketChannel.stateMu.Lock()
+	conn, open := webSocketChannel.Connection, webSocketChannel.IsOpen
+	webSocketChannel.stateMu.Unlock()
+	if !open {
 		return errors.New("Can't send message: Connection is closed.")
 	}
 
@@ -116,73 +145,95 @@ func (webSocketChannel *WebSocketChannel) SendMessage(log log.T, input []byte, i
 	}
 
 	webSocketChannel.writeLock.Lock()
-	err := webSocketChannel.Connection.WriteMessage(inputType, input)
+	err := conn.WriteMessage(inputType, input)
 	webSocketChannel.writeLock.Unlock()
 	return err
 }
 
 // Close closes the corresponding connection.
 func (webSocketChannel *WebSocketChannel) Close(log log.T) error {
-
-	log.Info("Closing websocket channel connection to: " + webSocketChannel.Url)
-	if webSocketChannel.IsOpen == true {
-		// Send signal to stop receiving message
+	webSocketChannel.stateMu.Lock()
+	defer webSocketChannel.stateMu.Unlock()
+	if webSocketChannel.IsOpen {
 		webSocketChannel.IsOpen = false
-		return websocketutil.NewWebsocketUtil(log, nil).CloseConnection(webSocketChannel.Connection)
+		close(webSocketChannel.done)
+		return webSocketChannel.Connection.Close()
 	}
-
-	log.Info("Websocket channel connection to: " + webSocketChannel.Url + " is already Closed!")
 	return nil
 }
 
 // Open upgrades the http connection to a websocket connection.
 func (webSocketChannel *WebSocketChannel) Open(log log.T) error {
-	// initialize the write mutex
-	webSocketChannel.writeLock = &sync.Mutex{}
-
-	ws, err := websocketutil.NewWebsocketUtil(log, nil).OpenConnection(webSocketChannel.Url)
+	ctx := webSocketChannel.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ws, err := websocketutil.NewWebsocketUtil(log, nil).OpenConnectionContext(ctx, webSocketChannel.Url)
 	if err != nil {
 		return err
 	}
+	webSocketChannel.stateMu.Lock()
 	webSocketChannel.Connection = ws
 	webSocketChannel.IsOpen = true
+	done := make(chan struct{})
+	webSocketChannel.done = done
+	webSocketChannel.workers.Add(2)
+	webSocketChannel.stateMu.Unlock()
 	webSocketChannel.StartPings(log, config.PingTimeInterval)
+	go func() {
+		defer webSocketChannel.workers.Done()
+		select {
+		case <-ctx.Done():
+			ws.Close()
+		case <-done:
+		}
+	}()
 
 	// spin up a different routine to listen to the incoming traffic
 	go func() {
+		defer webSocketChannel.workers.Done()
 		defer func() {
 			if msg := recover(); msg != nil {
 				log.Errorf("WebsocketChannel listener run panic: %v", msg)
 			}
 		}()
 
-		retryCount := 0
 		for {
-			if webSocketChannel.IsOpen == false {
-				log.Debugf("Ending the channel listening routine since the channel is closed: %s",
-					webSocketChannel.Url)
-				break
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			default:
 			}
-
-			messageType, rawMessage, err := webSocketChannel.Connection.ReadMessage()
+			messageType, rawMessage, err := ws.ReadMessage()
+			webSocketChannel.stateMu.Lock()
+			onError, onMessage := webSocketChannel.OnError, webSocketChannel.OnMessage
+			webSocketChannel.stateMu.Unlock()
 			if err != nil {
-				retryCount++
-				if retryCount >= config.RetryAttempt {
-					log.Errorf("Reach the retry limit %v for receive messages.", config.RetryAttempt)
-					webSocketChannel.OnError(err)
-					break
+				// A WebSocket read failure is permanent for this connection.
+				select {
+				case <-done:
+					return
+				case <-ctx.Done():
+					return
+				default:
 				}
-				log.Debugf("An error happened when receiving the message. Retried times: %v, Error: %v, Messagetype: %v",
-					retryCount,
-					err.Error(),
-					messageType)
+				if onError != nil {
+					onError(err)
+				}
+				return
 			} else if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
 				// We only accept text messages which are interpreted as UTF-8 or binary encoded text.
 				log.Errorf("Invalid message type. We only accept UTF-8 or binary encoded text. Message type: %v", messageType)
 
 			} else {
-				retryCount = 0
-				webSocketChannel.OnMessage(rawMessage)
+				if onMessage != nil {
+					onMessage(rawMessage)
+				}
 			}
 		}
 	}()

@@ -23,9 +23,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
-
-	"github.com/esoel/session-manager-plugin/src/config"
 
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/esoel/session-manager-plugin/src/datachannel"
@@ -74,6 +71,9 @@ func Register(session ISessionPlugin) {
 }
 
 type Session struct {
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	resendDone            chan struct{}
 	DataChannel           datachannel.IDataChannel
 	SessionId             string
 	StreamUrl             string
@@ -105,12 +105,22 @@ var setSessionHandlersWithSessionType = func(session *Session, log log.T) error 
 // Set up a scheduler to listen on stream data resend timeout event
 var handleStreamMessageResendTimeout = func(session *Session, log log.T) {
 	log.Tracef("Setting up scheduler to listen on IsStreamMessageResendTimeout event.")
+	session.resendDone = make(chan struct{})
 	go func() {
+		defer close(session.resendDone)
 		for {
-			// Repeat this loop for every 200ms
-			time.Sleep(config.ResendSleepInterval)
-			if <-session.DataChannel.IsStreamMessageResendTimeout() {
+			select {
+			case <-session.Context().Done():
+				return
+			case timedOut := <-session.DataChannel.IsStreamMessageResendTimeout():
+				if !timedOut {
+					continue
+				}
 				log.Errorf("Terminating session %s as the stream data was not processed before timeout.", session.SessionId)
+				if StopHook != nil {
+					session.Stop()
+					return
+				}
 				if err := session.TerminateSession(log); err != nil {
 					log.Errorf("Unable to terminate session upon stream data timeout. %v", err)
 				}
@@ -219,12 +229,36 @@ func ValidateInputAndStartSession(args []string, out io.Writer) {
 	}
 }
 
-// SessionContext provides cancellation for an embedded session handshake.
+// SessionContext provides cancellation for an embedded session's entire lifetime.
 // Set once before starting sessions.
 var SessionContext func(string) context.Context
 
+// Context returns the context captured by Execute, including for session copies
+// passed to a port handler. The hook is only consulted before Execute starts.
+func (s *Session) Context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	if SessionContext != nil {
+		return SessionContext(s.SessionId)
+	}
+	return context.Background()
+}
+
 // Execute create data channel and start the session
 func (s *Session) Execute(log log.T) (err error) {
+	s.ctx, s.cancel = context.WithCancel(s.Context())
+	defer s.cancel()
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	defer func() {
+		s.cancel()
+		s.DataChannel.Close(log)
+		if s.resendDone != nil {
+			<-s.resendDone
+		}
+	}()
 	fmt.Fprintf(os.Stdout, "\nStarting session with SessionId: %s\n", s.SessionId)
 
 	// sets the display mode
@@ -235,22 +269,14 @@ func (s *Session) Execute(log log.T) (err error) {
 		return
 	}
 
-	if StopHook != nil {
-		defer s.DataChannel.Close(log)
-	}
 	handleStreamMessageResendTimeout(s, log)
 
 	// The session type is set either by handshake or the first packet received.
 	var ready bool
-	if SessionContext != nil {
-		ctx := SessionContext(s.SessionId)
-		select {
-		case ready = <-s.DataChannel.IsSessionTypeSet():
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	} else {
-		ready = <-s.DataChannel.IsSessionTypeSet()
+	select {
+	case ready = <-s.DataChannel.IsSessionTypeSet():
+	case <-s.ctx.Done():
+		return s.ctx.Err()
 	}
 	if !ready {
 		log.Errorf("unable to set SessionType for session %s", s.SessionId)

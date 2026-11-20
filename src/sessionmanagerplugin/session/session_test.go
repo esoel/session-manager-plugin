@@ -1,3 +1,4 @@
+// Modified by the ssmc project: isolate mutable fixtures and join test sessions.
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may not
@@ -104,6 +105,8 @@ func TestValidateInputAndStartSessionWithWrongEnvVariableName(t *testing.T) {
 }
 
 func TestExecute(t *testing.T) {
+	previous := setSessionHandlersWithSessionType
+	defer func() { setSessionHandlersWithSessionType = previous }()
 	sessionMock := &Session{}
 	sessionMock.DataChannel = mockDataChannel
 	SetupMockActions()
@@ -128,6 +131,10 @@ func TestExecute(t *testing.T) {
 }
 
 func TestExecuteAndStreamMessageResendTimesOut(t *testing.T) {
+	previousTimeout, previousHandlers := handleStreamMessageResendTimeout, setSessionHandlersWithSessionType
+	defer func() {
+		handleStreamMessageResendTimeout, setSessionHandlersWithSessionType = previousTimeout, previousHandlers
+	}()
 	sessionMock := &Session{}
 	sessionMock.DataChannel = mockDataChannel
 	SetupMockActions()
@@ -155,16 +162,18 @@ func TestExecuteAndStreamMessageResendTimesOut(t *testing.T) {
 		return nil
 	}
 
-	var err error
+	done := make(chan error, 1)
 	go func() {
-		err = sessionMock.Execute(logger)
-		time.Sleep(200 * time.Millisecond)
+		done <- sessionMock.Execute(logger)
 	}()
 	wg.Wait()
-	assert.Nil(t, err)
+	assert.Nil(t, <-done)
 }
 
 func SetupMockActions() {
+	*mockDataChannel = dataChannelMock.IDataChannel{}
+	*mockWsChannel = wsChannelMock.IWebSocketChannel{}
+	mockDataChannel.On("Close", mock.Anything).Return(nil)
 	mockDataChannel.On("Initialize", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
 	mockDataChannel.On("SetWebsocket", mock.Anything, mock.Anything, mock.Anything).Return()
 	mockDataChannel.On("GetWsChannel").Return(mockWsChannel)

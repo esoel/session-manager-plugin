@@ -1,3 +1,4 @@
+// Modified by the ssmc project: cancellable retry backoff.
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may not
@@ -15,6 +16,7 @@
 package retry
 
 import (
+	"context"
 	"math"
 	"time"
 )
@@ -39,9 +41,18 @@ func (retryer *RepeatableExponentialRetryer) NextSleepTime(attempt int) time.Dur
 
 // Call calls the operation and does exponential retry if error happens.
 func (retryer *RepeatableExponentialRetryer) Call() (err error) {
+	return retryer.CallContext(context.Background())
+}
+
+// CallContext interrupts retry backoff when the owning session ends.
+// CallableFunc must also honor ctx while doing blocking work.
+func (retryer *RepeatableExponentialRetryer) CallContext(ctx context.Context) (err error) {
 	attempt := 0
 	failedAttemptsSoFar := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		err := retryer.CallableFunc()
 		if err == nil || failedAttemptsSoFar == retryer.MaxAttempts {
 			return err
@@ -51,7 +62,13 @@ func (retryer *RepeatableExponentialRetryer) Call() (err error) {
 			attempt = 0
 			sleep = retryer.NextSleepTime(attempt)
 		}
-		time.Sleep(sleep)
+		timer := time.NewTimer(sleep)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 		attempt++
 		failedAttemptsSoFar++
 	}

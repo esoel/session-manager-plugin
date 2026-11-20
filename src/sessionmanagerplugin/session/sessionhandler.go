@@ -16,9 +16,11 @@
 package session
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
+	"sync"
 
 	sdkSession "github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ssm"
@@ -39,6 +41,9 @@ func (s *Session) OpenDataChannel(log log.T) (err error) {
 	}
 
 	s.DataChannel.Initialize(log, s.ClientId, s.SessionId, s.TargetId, s.IsAwsCliUpgradeNeeded)
+	if channel, ok := s.DataChannel.(interface{ SetContext(context.Context) }); ok {
+		channel.SetContext(s.Context())
+	}
 	s.DataChannel.SetWebsocket(log, s.StreamUrl, s.TokenValue)
 	s.DataChannel.GetWsChannel().SetOnMessage(
 		func(input []byte) {
@@ -46,22 +51,36 @@ func (s *Session) OpenDataChannel(log log.T) (err error) {
 		})
 	s.DataChannel.RegisterOutputStreamHandler(s.ProcessFirstMessage, false)
 
-	if err = s.DataChannel.Open(log); err != nil {
-		log.Errorf("Retrying connection for data channel id: %s failed with error: %s", s.SessionId, err)
-		s.retryParams.CallableFunc = func() (err error) { return s.DataChannel.Reconnect(log) }
-		if err = s.retryParams.Call(); err != nil {
-			log.Error(err)
-		}
-	}
-
+	// Serialize the initial open and error callbacks. A peer can disconnect
+	// during the initial token handshake, before Open returns.
+	var connectionMu sync.Mutex
 	s.DataChannel.GetWsChannel().SetOnError(
 		func(err error) {
-			log.Errorf("Trying to reconnect the session: %v with seq num: %d", s.StreamUrl, s.DataChannel.GetStreamDataSequenceNumber())
-			s.retryParams.CallableFunc = func() (err error) { return s.ResumeSessionHandler(log) }
-			if err = s.retryParams.Call(); err != nil {
+			connectionMu.Lock()
+			defer connectionMu.Unlock()
+			if s.Context().Err() != nil {
+				return
+			}
+			log.Errorf("Trying to reconnect session %s", s.SessionId)
+			retries := s.retryParams
+			retries.CallableFunc = func() error { return s.ResumeSessionHandler(log) }
+			if err = retries.CallContext(s.Context()); err != nil {
 				log.Error(err)
+				s.Stop()
 			}
 		})
+
+	connectionMu.Lock()
+	err = s.DataChannel.Open(log)
+	if err != nil {
+		retries := s.retryParams
+		retries.CallableFunc = func() error { return s.DataChannel.Reconnect(log) }
+		err = retries.CallContext(s.Context())
+	}
+	connectionMu.Unlock()
+	if err != nil {
+		return err
+	}
 
 	// Scheduler for resending of data
 	s.DataChannel.ResendStreamDataMessageScheduler(log)
@@ -93,6 +112,9 @@ var StopHook func(string)
 
 // Stop will end the session
 func (s *Session) Stop() {
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if StopHook != nil {
 		StopHook(s.SessionId)
 		return
@@ -118,7 +140,7 @@ func (s *Session) GetResumeSessionParams(log log.T) (string, error) {
 	}
 
 	log.Debugf("Resume Session input parameters: %v", resumeSessionInput)
-	if resumeSessionOutput, err = s.sdk.ResumeSession(&resumeSessionInput); err != nil {
+	if resumeSessionOutput, err = s.sdk.ResumeSessionWithContext(s.Context(), &resumeSessionInput); err != nil {
 		log.Errorf("Resume Session failed: %v", err)
 		return "", err
 	}
@@ -168,7 +190,7 @@ func (s *Session) TerminateSession(log log.T) error {
 	}
 
 	log.Debugf("Terminate Session input parameters: %v", terminateSessionInput)
-	if _, err = s.sdk.TerminateSession(&terminateSessionInput); err != nil {
+	if _, err = s.sdk.TerminateSessionWithContext(s.Context(), &terminateSessionInput); err != nil {
 		log.Errorf("Terminate Session failed: %v", err)
 		return err
 	}

@@ -21,13 +21,13 @@ func TestEmbeddedListenerHook(t *testing.T) {
 	previous := Listen
 	defer func() { Listen = previous }()
 	l := &embeddingListener{}
-	Listen = func(network, address string) (net.Listener, error) {
-		if network != "tcp" || address != "localhost:2222" {
+	Listen = func(id, network, address string) (net.Listener, error) {
+		if id != "s-1" || network != "tcp" || address != "localhost:2222" {
 			t.Fatalf("listen %s %s", network, address)
 		}
 		return l, nil
 	}
-	p := &MuxPortForwarding{portParameters: PortParameters{LocalPortNumber: "2222"}}
+	p := &MuxPortForwarding{sessionId: "s-1", portParameters: PortParameters{LocalPortNumber: "2222"}}
 	err := p.handleClientConnections(log.NewMockLog(), context.Background())
 	if !errors.Is(err, net.ErrClosed) || !l.closed {
 		t.Fatalf("error=%v closed=%v", err, l.closed)
