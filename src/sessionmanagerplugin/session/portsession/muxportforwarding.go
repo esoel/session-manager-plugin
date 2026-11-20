@@ -1,3 +1,4 @@
+// Modified by the ssmc project: embedding lifecycle and listener hooks.
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may not
@@ -51,9 +52,14 @@ type MgsConn struct {
 	conn     net.Conn
 }
 
+// Listen allows embedding applications to supply a persistent local listener.
+// Set once before starting sessions. Close must release an individual lease.
+var Listen = net.Listen
+
 // MuxPortForwarding is type of port session
 // accepts multiple client connections through multiplexing
 type MuxPortForwarding struct {
+	stopOnce       sync.Once
 	port           IPortSession
 	sessionId      string
 	socketFile     string
@@ -80,6 +86,10 @@ func (p *MuxPortForwarding) IsStreamNotSet() (status bool) {
 
 // Stop closes all open stream
 func (p *MuxPortForwarding) Stop() {
+	p.stopOnce.Do(func() { p.stop() })
+}
+
+func (p *MuxPortForwarding) stop() {
 	if p.mgsConn != nil {
 		p.mgsConn.close()
 	}
@@ -87,13 +97,19 @@ func (p *MuxPortForwarding) Stop() {
 		p.muxClient.close()
 	}
 	p.cleanUp()
+	if session.StopHook != nil {
+		session.StopHook(p.sessionId)
+		return
+	}
 	os.Exit(0)
 }
 
 // InitializeStreams initializes i/o streams
 func (p *MuxPortForwarding) InitializeStreams(log log.T, agentVersion string) (err error) {
 
-	p.handleControlSignals(log)
+	if session.StopHook == nil {
+		p.handleControlSignals(log)
+	}
 	p.socketFile = getUnixSocketPath(p.sessionId, os.TempDir(), "session_manager_plugin_mux.sock")
 
 	if err = p.initialize(log, agentVersion); err != nil {
@@ -104,7 +120,12 @@ func (p *MuxPortForwarding) InitializeStreams(log log.T, agentVersion string) (e
 
 // ReadStream reads data from different connections
 func (p *MuxPortForwarding) ReadStream(log log.T) (err error) {
-	g, ctx := errgroup.WithContext(context.Background())
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g, ctx := errgroup.WithContext(base)
+	if session.StopHook != nil {
+		go func() { <-ctx.Done(); p.Stop() }()
+	}
 
 	// reads data from smux client and transfers to server over datachannel
 	g.Go(func() error {
@@ -233,7 +254,7 @@ func (p *MuxPortForwarding) handleClientConnections(log log.T, ctx context.Conte
 	)
 
 	if p.portParameters.LocalConnectionType == "unix" {
-		if listener, err = net.Listen(p.portParameters.LocalConnectionType, p.portParameters.LocalUnixSocket); err != nil {
+		if listener, err = Listen(p.portParameters.LocalConnectionType, p.portParameters.LocalUnixSocket); err != nil {
 			return err
 		}
 		displayMsg = fmt.Sprintf("Unix socket %s opened for sessionId %s.", p.portParameters.LocalUnixSocket, p.sessionId)
@@ -242,7 +263,7 @@ func (p *MuxPortForwarding) handleClientConnections(log log.T, ctx context.Conte
 		if p.portParameters.LocalPortNumber == "" {
 			localPortNumber = "0"
 		}
-		if listener, err = net.Listen("tcp", "localhost:"+localPortNumber); err != nil {
+		if listener, err = Listen("tcp", "localhost:"+localPortNumber); err != nil {
 			return err
 		}
 		p.portParameters.LocalPortNumber = strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
@@ -250,9 +271,18 @@ func (p *MuxPortForwarding) handleClientConnections(log log.T, ctx context.Conte
 	}
 
 	defer listener.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			listener.Close()
+		case <-done:
+		}
+	}()
 
 	log.Infof(displayMsg)
-	fmt.Printf(displayMsg)
+	fmt.Print(displayMsg)
 
 	log.Infof("Waiting for connections...\n")
 	fmt.Printf("\nWaiting for connections...\n")
@@ -265,6 +295,7 @@ func (p *MuxPortForwarding) handleClientConnections(log log.T, ctx context.Conte
 		default:
 			if conn, err := listener.Accept(); err != nil {
 				log.Errorf("Error while accepting connection: %v", err)
+				return err
 			} else {
 				log.Infof("Connection accepted from %s\n for session [%s]", conn.RemoteAddr(), p.sessionId)
 
@@ -274,6 +305,7 @@ func (p *MuxPortForwarding) handleClientConnections(log log.T, ctx context.Conte
 
 				stream, err := p.muxClient.session.OpenStream()
 				if err != nil {
+					conn.Close()
 					continue
 				}
 				log.Debugf("Client stream opened %d\n", stream.ID())

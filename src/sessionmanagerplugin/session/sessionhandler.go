@@ -1,3 +1,4 @@
+// Modified by the ssmc project: embedding lifecycle and listener hooks.
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may not
@@ -86,8 +87,16 @@ func (s *Session) ProcessFirstMessage(log log.T, outputMessage message.ClientMes
 	return true, nil
 }
 
+// StopHook lets an embedding application handle session termination.
+// Set once before starting sessions; the session ID identifies the owner.
+var StopHook func(string)
+
 // Stop will end the session
 func (s *Session) Stop() {
+	if StopHook != nil {
+		StopHook(s.SessionId)
+		return
+	}
 	os.Exit(0)
 }
 
@@ -130,6 +139,10 @@ func (s *Session) ResumeSessionHandler(log log.T) (err error) {
 	} else if s.TokenValue == "" {
 		log.Debugf("Session: %s timed out", s.SessionId)
 		fmt.Fprintf(os.Stdout, "Session: %s timed out.\n", s.SessionId)
+		if StopHook != nil {
+			s.Stop()
+			return fmt.Errorf("session timed out")
+		}
 		os.Exit(0)
 	}
 	s.DataChannel.GetWsChannel().SetChannelToken(s.TokenValue)

@@ -1,3 +1,4 @@
+// Modified by the ssmc project: embedding lifecycle and listener hooks.
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may not
@@ -15,6 +16,7 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -217,6 +219,10 @@ func ValidateInputAndStartSession(args []string, out io.Writer) {
 	}
 }
 
+// SessionContext provides cancellation for an embedded session handshake.
+// Set once before starting sessions.
+var SessionContext func(string) context.Context
+
 // Execute create data channel and start the session
 func (s *Session) Execute(log log.T) (err error) {
 	fmt.Fprintf(os.Stdout, "\nStarting session with SessionId: %s\n", s.SessionId)
@@ -229,10 +235,24 @@ func (s *Session) Execute(log log.T) (err error) {
 		return
 	}
 
+	if StopHook != nil {
+		defer s.DataChannel.Close(log)
+	}
 	handleStreamMessageResendTimeout(s, log)
 
 	// The session type is set either by handshake or the first packet received.
-	if !<-s.DataChannel.IsSessionTypeSet() {
+	var ready bool
+	if SessionContext != nil {
+		ctx := SessionContext(s.SessionId)
+		select {
+		case ready = <-s.DataChannel.IsSessionTypeSet():
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	} else {
+		ready = <-s.DataChannel.IsSessionTypeSet()
+	}
+	if !ready {
 		log.Errorf("unable to set SessionType for session %s", s.SessionId)
 		return errors.New("unable to determine SessionType")
 	} else {

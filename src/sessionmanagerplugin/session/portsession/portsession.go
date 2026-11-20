@@ -1,3 +1,4 @@
+// Modified by the ssmc project: embedding lifecycle and listener hooks.
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may not
@@ -15,6 +16,7 @@
 package portsession
 
 import (
+	"fmt"
 	"github.com/esoel/session-manager-plugin/src/config"
 	"github.com/esoel/session-manager-plugin/src/jsonutil"
 	"github.com/esoel/session-manager-plugin/src/log"
@@ -72,6 +74,9 @@ func (s *PortSession) Initialize(log log.T, sessionVar *session.Session) {
 				session:        s.Session,
 			}
 		} else {
+			if session.StopHook != nil {
+				return
+			} // embedding requires multiplexing
 			s.portSessionType = &BasicPortForwarding{
 				sessionId:      s.SessionId,
 				portParameters: s.portParameters,
@@ -111,6 +116,9 @@ func (s *PortSession) Stop() {
 
 // StartSession redirects inputStream/outputStream data to datachannel.
 func (s *PortSession) SetSessionHandlers(log log.T) (err error) {
+	if s.portSessionType == nil {
+		return fmt.Errorf("forward requires SSM agent 3.0.222 or newer (multiplexing)")
+	}
 	if err = s.portSessionType.InitializeStreams(log, s.DataChannel.GetAgentVersion()); err != nil {
 		return err
 	}
